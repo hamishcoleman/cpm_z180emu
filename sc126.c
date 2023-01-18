@@ -146,6 +146,8 @@ enum sd_state {
     IDLE = 0,
     RX_CMD,
     TX_RESP,
+    PRE_WRITE_STAT,
+    WRITE_BLOCK,
 };
 
 struct sd_cardstate {
@@ -211,6 +213,9 @@ void sd_write(device_t *device, int channel, UINT8 data) {
             return;
         }
         sd->state = RX_CMD;
+    } else if (sd->state == WRITE_BLOCK) {
+        // FIXME - implement a buffer!
+        return;
     }
     // else bad state?
 
@@ -321,7 +326,7 @@ void sd_write(device_t *device, int channel, UINT8 data) {
                 sd->cmd[3]<<8 |
                 sd->cmd[4]
             );
-            printf("SD:READ: 0x%04x\n", block);
+            printf("SD:READ:  0x%04x\n", block);
 
             sd_state_reset(sd);
             sd->resp[rp++] = 0xff;
@@ -334,6 +339,22 @@ void sd_write(device_t *device, int channel, UINT8 data) {
             sd->resp[512+3+0] = 0x05; // CRC
             sd->resp[512+3+1] = 0x0a;
             sd->state = TX_RESP;
+            break;
+        }
+        case 0x58: { // CMD24 WRITE_BLOCK
+            int block = (
+                sd->cmd[1]<<24 |
+                sd->cmd[2]<<16 |
+                sd->cmd[3]<<8 |
+                sd->cmd[4]
+            );
+            printf("SD:WRITE: 0x%04x\n", block);
+
+            sd_state_reset(sd);
+            sd->resp[rp++] = 0xff;
+            sd->resp[rp++] = 0x01;
+
+            sd->state = PRE_WRITE_STAT;
             break;
         }
 
@@ -411,6 +432,12 @@ int sd_read(device_t *device, int channel) {
         // got a read when we expected more writes
         sd_state_reset(sd);
     }
+    if (sd->state == WRITE_BLOCK) {
+        // got the read after the end of a write block
+        sd->state = TX_RESP;
+        result = 0x05; // Data accepted
+        goto out;
+    }
     if (sd->state == IDLE) {
         // in idle mode, the card just outputs ones?
         result = 0xff;
@@ -421,6 +448,10 @@ int sd_read(device_t *device, int channel) {
     sd->resp_ptr = sd->resp_ptr + 1;
     if (sd->resp_ptr >= sizeof(sd->resp)) {
         sd->resp_ptr = 0;
+    }
+
+    if (sd->state == PRE_WRITE_STAT && sd->resp_ptr == 2) {
+        sd->state = WRITE_BLOCK;
     }
 
 out:
