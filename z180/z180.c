@@ -1106,9 +1106,10 @@ UINT8 z180_readcontrol(struct z180_state *cpustate, offs_t port)
 		case Z180_TRDR:
                         if (cpustate->device->z180csi_rx_cb)
                             data = cpustate->device->z180csi_rx_cb(cpustate->device,0);
-                        else
+                        else {
                             logerror("Z180 '%s' TRDR   rd $%02x ($%02x)\n", cpustate->device->m_tag, data, cpustate->io[port]);
 			    data = cpustate->IO_TRDR & Z180_TRDR_RMASK;
+                        }
 			break;
 
 		case Z180_TMDR0L:
