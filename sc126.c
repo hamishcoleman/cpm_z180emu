@@ -319,9 +319,9 @@ void sd_write(device_t *device, int channel, UINT8 data) {
                 sd->cmd[1]<<24 |
                 sd->cmd[2]<<16 |
                 sd->cmd[3]<<8 |
-                sd->cmd[5]
+                sd->cmd[4]
             );
-            // printf("SD:READ: 0x%04x\n", block);
+            printf("SD:READ: 0x%04x\n", block);
 
             sd_state_reset(sd);
             sd->resp[rp++] = 0xff;
