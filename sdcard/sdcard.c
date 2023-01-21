@@ -3,7 +3,8 @@
  * (c)2023 Hamish Coleman <hamish@zot.org>
  *
  * TODO:
- * - actually provide a backing file!
+ * - hook up writes
+ * - improve the CSD to reflect the actual size of the backing file
  * - switch to a better emulation of the SPI bus (simultaneously read/write)
  * - which would allow a better state machine
  * - improve the state machine to have more states and less special cases
@@ -12,7 +13,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-
+#include <fcntl.h>
+#include <unistd.h>
 
 typedef uint8_t UINT8;
 
@@ -21,7 +23,19 @@ typedef uint8_t UINT8;
 int sdcard_trace = 1;
 
 void sdcard_reset(struct sdcard_device *sd) {
+    sd->state = IDLE;
+    sd->cmd_ptr = 0;
+    sd->resp_ptr = 0;
+}
+
+int sdcard_init(struct sdcard_device *sd, char *filename) {
     memset((void *)sd, 0, sizeof(*sd));
+    sdcard_reset(sd);
+
+    if ((sd->fd = open(filename, O_RDWR))==-1) {
+        return -1;
+    }
+    return 1;
 }
 
 void sdcard_dump(struct sdcard_device *sd) {
@@ -177,12 +191,13 @@ int sdcard_write(struct sdcard_device *sd, UINT8 data) {
             printf("SD:READ:  0x%04x\n", block);
 
             sdcard_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-            sd->resp[rp++] = 0xfe; // data token
+            sd->resp[0] = 0xff;
+            sd->resp[1] = 0x01;
+            sd->resp[2] = 0xfe; // data token
 
-            int *p = (int*)&sd->resp[8];
-            *p = block;
+            if (lseek(sd->fd, block*0x200, SEEK_SET) != -1) {
+                read(sd->fd, &sd->resp[3], 0x200);
+            }
 
             sd->resp[512+3+0] = 0x05; // CRC
             sd->resp[512+3+1] = 0x0a;
@@ -273,6 +288,7 @@ int sdcard_read(struct sdcard_device *sd, UINT8 data) {
     if (sd->state == WRITE_BLOCK) {
         // got the read after the end of a write block
         sd->state = TX_RESP;
+
         result = 0x05; // Data accepted
         goto out;
     }
