@@ -43,6 +43,7 @@
 
 #include "z180/z180.h"
 #include "ds1202_1302/ds1202_1302.h"
+#include "sdcard/sdcard.h"
 
 // so far only 512k EEPROM+512k RAM is supported
 UINT8 _ram[1048576]; // lo 512k is ROM
@@ -120,9 +121,8 @@ void print_bin_u8(UINT8 v) {
     }
 }
 
-UINT8 rtc_latch;
-
-// The serial port on the Z180 is backwards for SPI, so here is a quick table to bitswap a byte
+// The serial port on the Z180 is backwards for SPI sdcards,
+// so here is a quick table to bitswap a byte
 UINT8 mirtab[256] = {
     0x00, 0x80, 0x40, 0x0C0, 0x20, 0x0A0, 0x60, 0x0E0, 0x10, 0x90, 0x50, 0x0D0, 0x30, 0x0B0, 0x70, 0x0F0,
     0x08, 0x88, 0x48, 0x0C8, 0x28, 0x0A8, 0x68, 0x0E8, 0x18, 0x98, 0x58, 0x0D8, 0x38, 0x0B8, 0x78, 0x0F8,
@@ -142,323 +142,31 @@ UINT8 mirtab[256] = {
     0x0F, 0x8F, 0x4F, 0x0CF, 0x2F, 0x0AF, 0x6F, 0x0EF, 0x1F, 0x9F, 0x5F, 0x0DF, 0x3F, 0x0BF, 0x7F, 0x0FF,
 };
 
-enum sd_state {
-    IDLE = 0,
-    RX_CMD,
-    TX_RESP,
-    PRE_WRITE_STAT,
-    WRITE_BLOCK,
-};
+UINT8 rtc_latch;
+struct sdcard_device sd0;
 
-struct sd_cardstate {
-    enum sd_state state;
-    int cmd_ptr;
-    int resp_ptr;
-    UINT8 cmd[8];
-    UINT8 resp[512+6];
-};
-
-struct sd_cardstate sd0;
-int sd_trace = 1;
-
-void sd_state_reset(struct sd_cardstate *sd) {
-    memset((void *)sd, 0, sizeof(*sd));
-}
-
-void sd_dump(struct sd_cardstate *sd) {
-    printf("SD:DUMP:  s%i,t%x,r%x, ",
-        sd->state,
-        sd->cmd_ptr,
-        sd->resp_ptr
-    );
-
-    int i;
-    for (i=0; i<sizeof(sd->cmd); i++) {
-        printf("%02x", sd->cmd[i]);
-    }
-    printf("-");
-    for (i=0; i<20; i++) {
-        printf("%02x", sd->resp[i]);
-    }
-    printf("\n");
-
-}
-
-void sd_write(device_t *device, int channel, UINT8 data) {
-    if ((rtc_latch & 0x04) == 4) {
-        // CS0 is not active
+void sci_write(device_t *device, int channel, UINT8 data) {
+    if ((rtc_latch & 0x04) == 0) {
+        // The /CS0 is active
+        sdcard_write(&sd0, mirtab[data]);
+    } else {
         printf("IO:CSI:   TRDR   = 0x%02x (latch=", data);
         print_bin_u8(rtc_latch);
         printf(")\n");
-        return;
-    }
-
-    struct sd_cardstate *sd = &sd0;
-    data = mirtab[data];
-
-    if (sd_trace) {
-        sd_dump(sd);
-        printf("SD:WR:    d=0x%02x\n", data);
-    }
-
-    if (sd->state == TX_RESP) {
-        // got a write when we thought we needed a read
-        sd_state_reset(sd);
-    }
-    if (sd->state == IDLE) {
-        sd_state_reset(sd);
-        if (data &0x80) {
-            // if the first byte of a cmd doesnt have b7=0, b6=1
-            // this is probably a dummy write, stay in IDLE
-            return;
-        }
-        sd->state = RX_CMD;
-    } else if (sd->state == WRITE_BLOCK) {
-        // FIXME - implement a buffer!
-        return;
-    }
-    // else bad state?
-
-    sd->cmd[sd->cmd_ptr] = data;
-    sd->cmd_ptr = (sd->cmd_ptr & 0x07) + 1;
-
-    if (sd->cmd_ptr != 6) {
-        return;
-    }
-
-    UINT8 cmd = sd->cmd[0];
-
-    // we have a whole cmd
-    // should start with 0b01xxxxxx (x = cmd)
-    // should end with   0bccccccc1 (c = crc)
-
-    // TODO: check cmd[5] CRC
-
-    int rp = 0;
-    switch (cmd) {
-        case 0x40: // CMD0  GO_IDLE_STATE
-        case 0x77: // CMD55 APP_CMD
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x01;
-            sd->state = TX_RESP;
-            break;
-        case 0x48: // CMD8  SEND_IF_COND
-            // TODO: check arg 00 00 01 aa
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x01;
-            sd->resp[2] = 0x00;
-            sd->resp[3] = 0x00;
-            sd->resp[4] = 0x01;
-            sd->resp[5] = 0xaa;
-            sd->state = TX_RESP;
-            break;
-        case 0x49: // CMD9  SEND_CSD
-            sd_state_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-            sd->resp[rp++] = 0xfe; // data token
-
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00; // LBA
-            sd->resp[rp++] = 0x08; // .
-            sd->resp[rp++] = 0x00; // .
-            sd->resp[rp++] = 0x00; // Approx 1Gig
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            // TODO: use real sizes
-
-            sd->resp[rp++] = 0x05; // CRC1
-            sd->resp[rp++] = 0x0a; // CRC2
-            sd->state = TX_RESP;
-            break;
-        case 0x4a: // CMD10 SEND_CID
-            sd_state_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-            sd->resp[rp++] = 0xfe; // data token
-
-            sd->resp[rp++] = 0x01; // Manuf
-            sd->resp[rp++] = 'A'; // App
-            sd->resp[rp++] = 'A';
-            sd->resp[rp++] = 'B'; // Name
-            sd->resp[rp++] = 'B';
-            sd->resp[rp++] = 'B';
-            sd->resp[rp++] = 'B';
-            sd->resp[rp++] = 'B';
-            sd->resp[rp++] = 0x10; // Rev
-            sd->resp[rp++] = 0x12; // Serial
-            sd->resp[rp++] = 0x34;
-            sd->resp[rp++] = 0x56;
-            sd->resp[rp++] = 0x78;
-            sd->resp[rp++] = 0x00; // 2YY
-            sd->resp[rp++] = 0x01; // YM
-            sd->resp[rp++] = 0x00;
-
-            sd->resp[rp++] = 0x05; // CRC1
-            sd->resp[rp++] = 0x0a; // CRC2
-            sd->state = TX_RESP;
-            break;
-        case 0x50: // CMD16 SET_BLOCKLEN
-            // TODO: do a real check of the value
-            if (sd->cmd[3] != 2) {
-                goto error;
-            }
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x01;
-            sd->state = TX_RESP;
-            break;
-        case 0x51: { // CMD17 READ_SINGLE_BLOCK
-            int block = (
-                sd->cmd[1]<<24 |
-                sd->cmd[2]<<16 |
-                sd->cmd[3]<<8 |
-                sd->cmd[4]
-            );
-            printf("SD:READ:  0x%04x\n", block);
-
-            sd_state_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-            sd->resp[rp++] = 0xfe; // data token
-
-            int *p = (int*)&sd->resp[8];
-            *p = block;
-
-            sd->resp[512+3+0] = 0x05; // CRC
-            sd->resp[512+3+1] = 0x0a;
-            sd->state = TX_RESP;
-            break;
-        }
-        case 0x58: { // CMD24 WRITE_BLOCK
-            int block = (
-                sd->cmd[1]<<24 |
-                sd->cmd[2]<<16 |
-                sd->cmd[3]<<8 |
-                sd->cmd[4]
-            );
-            printf("SD:WRITE: 0x%04x\n", block);
-
-            sd_state_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-
-            sd->state = PRE_WRITE_STAT;
-            break;
-        }
-
-        case 0x7a: // CMD58 READ_OCR
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x01;
-            sd->resp[2] = 0x40; // bit30 == HCS
-            sd->resp[3] = 0x00;
-            sd->resp[4] = 0x00;
-            sd->resp[5] = 0x00;
-            sd->state = TX_RESP;
-            break;
-
-        // TODO: gate ACMD values on a previous CMD55 APP_CMD
-        case 0x69: // ACMD41 SEND_OP_COND
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x00;
-            sd->state = TX_RESP;
-            break;
-        case 0x73: // ACMD51 SEND_SCR
-            sd_state_reset(sd);
-            sd->resp[rp++] = 0xff;
-            sd->resp[rp++] = 0x01;
-            sd->resp[rp++] = 0xfe; // data token
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x30; // SD_SEC_2 == SDHC
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x00;
-            sd->resp[rp++] = 0x05; // CRC1
-            sd->resp[rp++] = 0x0a; // CRC2
-            sd->state = TX_RESP;
-            break;
-
-error:
-        default:
-            sd_state_reset(sd);
-            sd->resp[0] = 0xff;
-            sd->resp[1] = 0x05; // illegal command
-            sd->state = TX_RESP;
-
-            printf("unknown\n");
-            printf("SD:CMD:   cmd=0x%02x\n",cmd);
-
-            sd_state_reset(sd);
-            return;
-    }
-    if (sd_trace) {
-        printf("\n");
     }
 }
 
-int sd_read(device_t *device, int channel) {
-    if ((rtc_latch & 0x04) == 4) {
-        // CS0 is not active
-        sd_state_reset(&sd0);
+int sci_read(device_t *device, int channel) {
+    int result = 0xff;
+    if ((rtc_latch & 0x04) == 0) {
+        // The /CS0 is active
+        result = mirtab[sdcard_read(&sd0, 0xff)];
+    } else {
         printf("IO:CSI:   TRDR          (latch=");
         print_bin_u8(rtc_latch);
         printf(")\n");
     }
-
-    struct sd_cardstate *sd = &sd0;
-
-    UINT8 result;
-    if (sd_trace) {
-        sd_dump(sd);
-    }
-
-    if (sd->state == RX_CMD) {
-        // got a read when we expected more writes
-        sd_state_reset(sd);
-    }
-    if (sd->state == WRITE_BLOCK) {
-        // got the read after the end of a write block
-        sd->state = TX_RESP;
-        result = 0x05; // Data accepted
-        goto out;
-    }
-    if (sd->state == IDLE) {
-        // in idle mode, the card just outputs ones?
-        result = 0xff;
-        goto out;
-    }
-
-    result = sd->resp[sd->resp_ptr];
-    sd->resp_ptr = sd->resp_ptr + 1;
-    if (sd->resp_ptr >= sizeof(sd->resp)) {
-        sd->resp_ptr = 0;
-    }
-
-    if (sd->state == PRE_WRITE_STAT && sd->resp_ptr == 2) {
-        sd->state = WRITE_BLOCK;
-    }
-
-out:
-    if (sd_trace) {
-        printf("SD:RD:    r=0x%02x\n", result);
-    }
-    return mirtab[result];
+    return result;
 }
 
 UINT8 io_read (offs_t Port) {
@@ -626,15 +334,15 @@ int main(int argc, char** argv)
 	setmode(fileno(stdout), O_BINARY);
 #endif
 
-        sd_state_reset(&sd0);
 	boot1dma();
+        sdcard_reset(&sd0);
 
 	rtc = ds1202_1302_init("RTC",1302);
 	ds1202_1302_reset(rtc);
 	atexit(destroy_rtc);
 
 	cpu = cpu_create_z180("Z180",Z180_TYPE_Z180,18432000,&ram,NULL,&iospace,irq0ackcallback,NULL/*daisychain*/,
-		asci_rx,asci_tx,sd_read,sd_write,NULL,NULL,NULL,NULL);
+		asci_rx,asci_tx,sci_read,sci_write,NULL,NULL,NULL,NULL);
 	//printf("1\n");fflush(stdout);
 	cpu_reset_z180(cpu);
 	//printf("2\n");fflush(stdout);
