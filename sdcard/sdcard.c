@@ -28,15 +28,19 @@ int sdcard_trace = 1;
 
 char *sdcard_state_names[] = {
     [IDLE] = "IDLE",
+
     [RX_CMD] = "RX_CMD",
+    [RX_BLOCK] = "RX_BLOCK",
+
     [TX_BUSY] = "TX_BUSY",
     [TX_R1] = "TX_R1",
     [TX_R3] = "TX_R3",
     [TX_R7] = "TX_R7",
     [TX_IMM32] = "TX_IMM32",
-    [TX_R1_TX_BLOCK] = "TX_R1_TX_BLOCK",
-    [TX_R1_RX_BLOCK] = "TX_R1_RX_BLOCK",
-    [RX_BLOCK] = "RX_BLOCK",
+    [TX_BLOCK_R1] = "TX_BLOCK_R1",
+    [TX_BLOCK_TOKEN] = "TX_BLOCK_TOKEN",
+    [TX_BLOCK_BUF] = "TX_BLOCK_BUF",
+    [TX_RX_BLOCK_R1] = "TX_RX_BLOCK_R1",
     [TX_RX_BLOCK_STAT] = "TX_RX_BLOCK_STAT",
 
     [NEXT] = "next",
@@ -133,10 +137,11 @@ void sdcard_resp_r7(struct sdcard_device *sd, UINT8 r1, int value) {
     sdcard_setstate(sd, TX_BUSY);
 }
 
-void sdcard_resp_tx_block(struct sdcard_device *sd, int tx_len) {
+void sdcard_resp_tx_block(struct sdcard_device *sd, UINT8 r1, int tx_len) {
     sd->resp_ptr = 0;
     sd->tx_len = tx_len;
-    sd->state_next = TX_R1_TX_BLOCK;
+    sd->r1 = r1;
+    sd->state_next = TX_BLOCK_R1;
     sdcard_setstate(sd, TX_BUSY);
 }
 
@@ -144,7 +149,7 @@ void sdcard_resp_rx_block(struct sdcard_device *sd) {
     sd->resp_ptr = 0;
     sd->tx_len = 0; // We are overwriting it, so it must be zero
     sd->r1 = 0x01; // afterwards, return idle state
-    sd->state_next = TX_R1_RX_BLOCK;
+    sd->state_next = TX_RX_BLOCK_R1;
     sdcard_setstate(sd, TX_BUSY);
 }
 
@@ -165,8 +170,10 @@ int sdcard_write(struct sdcard_device *sd, int cs, UINT8 data) {
         case TX_R3:
         case TX_R7:
         case TX_IMM32:
-        case TX_R1_TX_BLOCK:
-        case TX_R1_RX_BLOCK:
+        case TX_BLOCK_R1:
+        case TX_BLOCK_TOKEN:
+        case TX_BLOCK_BUF:
+        case TX_RX_BLOCK_R1:
         case TX_RX_BLOCK_STAT:
             // got a write when we thought we needed a read
             dprint(2,"SD: got write, expected read (data=0x%02x)\n", data);
@@ -280,7 +287,7 @@ int sdcard_write(struct sdcard_device *sd, int cs, UINT8 data) {
             sd->resp[rp++] = 0x01; // last bit is stop bit
             // TODO: use real backing store for size
 
-            sdcard_resp_tx_block(sd, 16);
+            sdcard_resp_tx_block(sd, R1_0,16);
             break;
 
         case 0x4a:
@@ -303,7 +310,7 @@ int sdcard_write(struct sdcard_device *sd, int cs, UINT8 data) {
             sd->resp[rp++] = 0x01; // y=2001
             sd->resp[rp++] = 0x01; // last bit is stop bit
 
-            sdcard_resp_tx_block(sd, 16);
+            sdcard_resp_tx_block(sd, R1_0, 16);
             break;
 
         case 0x50:
@@ -331,7 +338,8 @@ int sdcard_write(struct sdcard_device *sd, int cs, UINT8 data) {
                 read(sd->fd, &sd->resp, 0x200);
             }
 
-            sdcard_resp_tx_block(sd, 512);
+            // TODO: could use result of read as source of r1 status
+            sdcard_resp_tx_block(sd, R1_0, 512);
             break;
         }
 
@@ -375,7 +383,7 @@ int sdcard_write(struct sdcard_device *sd, int cs, UINT8 data) {
             sd->resp[rp++] = 0x00;
             sd->resp[rp++] = 0x00;
             sd->resp[rp++] = 0x00;
-            sdcard_resp_tx_block(sd, 8);
+            sdcard_resp_tx_block(sd, R1_0, 8);
             break;
 
         default:
@@ -440,34 +448,35 @@ int sdcard_read(struct sdcard_device *sd, int cs, UINT8 data) {
 
             break;
 
-        case TX_R1_TX_BLOCK:
-            switch (sd->resp_ptr) {
-                case 0:
-                    result = 0x00; // second, send R1
-                    break;
-                case 1:
-                    result = 0xfe; // finally, data token
-                    break;
+        // TODO? with a deeper queue of state_next values, the TX_BLOCK
+        // could be simpler
+        case TX_BLOCK_R1:
+            result = sd->r1;
+            sdcard_setstate(sd, TX_BLOCK_TOKEN);
+            break;
 
-                default: {
-                    int index = sd->resp_ptr-2;
+        case TX_BLOCK_TOKEN:
+            result = 0xfe; // data token
+            sdcard_setstate(sd, TX_BLOCK_BUF);
+            break;
 
-                    if (index < sd->tx_len) {
-                        // Send the actual data
-                        result = sd->resp[index];
-                    } else if (index == sd->tx_len) {
-                        result = 0; // CRC1;
-                    } else if (index == sd->tx_len+1) {
-                        result = 0; // CRC2;
-                        sdcard_setstate(sd, IDLE);
-                    }
-                    break;
-                }
+        case TX_BLOCK_BUF: {
+            int index = sd->resp_ptr;
+
+            if (index < sd->tx_len) {
+                // Send the actual data
+                result = sd->resp[index];
+            } else if (index == sd->tx_len) {
+                result = 0; // CRC1;
+            } else {
+                result = 0; // CRC2;
+                sdcard_setstate(sd, IDLE);
             }
             sd->resp_ptr++;
             break;
+        }
 
-        case TX_R1_RX_BLOCK:
+        case TX_RX_BLOCK_R1:
             result = sd->r1;
             sdcard_reset_ptr(sd);
             sdcard_setstate(sd, RX_BLOCK);
